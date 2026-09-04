@@ -32,6 +32,8 @@ MEMORY_QUERY = (
     "Review a synthetic SaaS agreement using durable reviewer preferences "
     "for limitation of liability and indemnification."
 )
+DEFAULT_LLM_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+DEFAULT_LLM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 
 class ReviewFinding(BaseModel):
@@ -122,31 +124,46 @@ def review_contract(
     return validate_review(result, contract_text)
 
 
-def call_anthropic(system: str, messages: list[dict[str, str]]) -> ReviewResult:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    model = os.environ.get("ANTHROPIC_MODEL")
+def call_nvidia(system: str, messages: list[dict[str, str]]) -> ReviewResult:
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    model = os.environ.get("LLM_MODEL", "").strip() or DEFAULT_LLM_MODEL
+    base_url = os.environ.get("LLM_BASE_URL", "").strip() or DEFAULT_LLM_BASE_URL
     if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY is required")
-    if not model:
-        raise ValueError("ANTHROPIC_MODEL is required")
+        raise ValueError("NVIDIA_API_KEY is required")
+    request_messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{system}\n\nReturn only a JSON object matching OUTPUT_JSON_SCHEMA:\n"
+                f"{json.dumps(ReviewResult.model_json_schema())}"
+            ),
+        },
+        *messages,
+    ]
     try:
-        from anthropic import Anthropic
+        from openai import OpenAI
 
-        response = Anthropic(api_key=api_key).messages.parse(
+        response = OpenAI(api_key=api_key, base_url=base_url).chat.completions.create(
             model=model,
             max_tokens=4_000,
             temperature=0,
-            system=system,
-            messages=messages,
-            output_format=ReviewResult,
+            messages=request_messages,
+            response_format={"type": "json_object"},
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
     except Exception as exc:
         raise RuntimeError(f"model request failed ({type(exc).__name__})") from exc
-    for block in response.content:
-        parsed = getattr(block, "parsed_output", None)
-        if parsed is not None:
-            return ReviewResult.model_validate(parsed)
-    raise RuntimeError("model returned no structured review")
+    try:
+        choice = response.choices[0]
+    except (AttributeError, IndexError) as exc:
+        raise RuntimeError("model returned no structured review") from exc
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason != "stop":
+        raise RuntimeError(f"model response incomplete ({finish_reason})")
+    content = getattr(getattr(choice, "message", None), "content", None)
+    if not content:
+        raise RuntimeError("model returned no structured review")
+    return ReviewResult.model_validate_json(content)
 
 
 def show_findings(result: ReviewResult, output: Callable[[str], None] = print) -> None:
@@ -347,7 +364,7 @@ def review_once(
     contract_path: str | Path,
     *,
     memory: Literal["on", "off"],
-    model_call: Callable[[str, list[dict[str, str]]], ReviewResult | dict] = call_anthropic,
+    model_call: Callable[[str, list[dict[str, str]]], ReviewResult | dict] = call_nvidia,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     mubit_client: Any = None,
@@ -394,7 +411,7 @@ def verdict_counts(verdicts: list[HumanVerdict]) -> dict[str, int]:
 def compare_contract(
     contract_path: str | Path,
     *,
-    model_call: Callable[[str, list[dict[str, str]]], ReviewResult | dict] = call_anthropic,
+    model_call: Callable[[str, list[dict[str, str]]], ReviewResult | dict] = call_nvidia,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     mubit_client: Any = None,
@@ -421,7 +438,7 @@ def compare_contract(
     on_counts = verdict_counts(memory_on["verdicts"])
     comparison = {
         "contract_sha256": hashlib.sha256(contract_text.encode("utf-8")).hexdigest(),
-        "model": os.environ.get("ANTHROPIC_MODEL", "test-double"),
+        "model": os.environ.get("LLM_MODEL", "").strip() or DEFAULT_LLM_MODEL,
         "memory_off": {
             "run_id": memory_off["run_id"],
             "retrieved_memories": 0,

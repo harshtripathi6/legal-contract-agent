@@ -29,9 +29,16 @@ source .env
 set +a
 ```
 
-`ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` are always required. Mubit variables
-are required only for Memory ON. Use a fresh synthetic `MUBIT_USER` for each
-clean demonstration, while keeping it unchanged across Contract A and B.
+`NVIDIA_API_KEY` is always required. `LLM_MODEL` defaults to
+`nvidia/nemotron-3.5-lightning-30b-a3b`, and `LLM_BASE_URL` defaults to NVIDIA's
+hosted NIM endpoint. Mubit variables are required only for Memory ON. Use a
+fresh synthetic `MUBIT_USER` for each clean demonstration, while keeping it
+unchanged across Contract A and B.
+
+The single inference path uses the official OpenAI Python client with NVIDIA's
+OpenAI-compatible Chat Completions endpoint. It requests JSON mode, disables
+model reasoning for the structured response, and validates the returned JSON
+against the strict Pydantic review schema before displaying any finding.
 
 ## Demo
 
