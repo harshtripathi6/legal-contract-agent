@@ -107,6 +107,7 @@ class ContractReviewTests(unittest.TestCase):
         )
         self.assertEqual(call["temperature"], 0)
         self.assertIn("OUTPUT_JSON_SCHEMA", call["messages"][0]["content"])
+        self.assertIn("Do not return or describe the schema", call["messages"][0]["content"])
 
         openai_client.return_value.chat.completions.create.return_value = SimpleNamespace(
             choices=[
@@ -157,13 +158,15 @@ class ContractReviewTests(unittest.TestCase):
             def __getattr__(self, name):
                 raise AssertionError(f"Mubit method called in memory-off mode: {name}")
 
-        run = review_once(
-            Path(__file__).parents[1] / "contracts" / "contract_a.md",
-            memory="off",
-            model_call=lambda _system, _messages: {"findings": []},
-            output=output.append,
-            mubit_client=MustNotBeCalled(),
-        )
+        with patch("contract_review.create_mubit_client") as create_client:
+            run = review_once(
+                Path(__file__).parents[1] / "contracts" / "contract_a.md",
+                memory="off",
+                model_call=lambda _system, _messages: {"findings": []},
+                output=output.append,
+                mubit_client=MustNotBeCalled(),
+            )
+        create_client.assert_not_called()
         self.assertEqual(run["memory"], "off")
         self.assertEqual(run["retrieved_memories"], 0)
         self.assertEqual(run["verdicts"], [])
@@ -182,7 +185,11 @@ class ContractReviewTests(unittest.TestCase):
 
             def remember(self, **kwargs):
                 calls.append(("remember", kwargs))
-                return {"done": True, "status": "completed"}
+                return {
+                    "done": True,
+                    "status": "completed",
+                    "traces": [{"writes": [{"success": True, "record_id": "feedback-1"}]}],
+                }
 
             def record_outcome(self, **kwargs):
                 calls.append(("record_outcome", kwargs))
@@ -199,6 +206,7 @@ class ContractReviewTests(unittest.TestCase):
 
         def model(system, _messages):
             self.assertIn("Prefer a mutual one-times-fees cap.", system)
+            self.assertNotIn("lesson-1", system)
             return {
                 "findings": [
                     {
@@ -225,6 +233,7 @@ class ContractReviewTests(unittest.TestCase):
         self.assertEqual([name for name, _kwargs in calls], [
             "get_context", "remember", "record_outcome", "reflect"
         ])
+        self.assertEqual(sum(name == "reflect" for name, _kwargs in calls), 1)
         context_args = calls[0][1]
         self.assertEqual(context_args["entry_types"], ["lesson"])
         self.assertFalse(context_args["include_working_memory"])
@@ -232,7 +241,10 @@ class ContractReviewTests(unittest.TestCase):
         self.assertTrue(remember_args["wait"])
         self.assertEqual(remember_args["lesson_scope"], "global")
         self.assertNotIn(quote, remember_args["content"])
+        self.assertNotIn("# Northstar Analytics SaaS Agreement", remember_args["content"])
+        self.assertIn("accepted position", remember_args["content"])
         outcome_args = calls[2][1]
+        self.assertEqual(outcome_args["reference_id"], "feedback-1")
         self.assertEqual(outcome_args["entry_ids"], ["lesson-1"])
         self.assertEqual(outcome_args["outcome"], "success")
         self.assertEqual(outcome_args["signal"], 1.0)
@@ -256,6 +268,31 @@ class ContractReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "persistence failed"):
             persist_feedback(FailedMubit(), "run-1", "user-1", result, verdicts, [])
         self.assertEqual(calls, ["remember"])
+
+    def test_failed_outcome_prevents_reflection(self):
+        calls = []
+
+        class FailedOutcomeMubit:
+            def remember(self, **_kwargs):
+                calls.append("remember")
+                return {
+                    "done": True,
+                    "status": "completed",
+                    "traces": [{"writes": [{"success": True, "record_id": "feedback-1"}]}],
+                }
+
+            def record_outcome(self, **_kwargs):
+                calls.append("record_outcome")
+                return {"success": False}
+
+            def reflect(self, **_kwargs):
+                calls.append("reflect")
+
+        result = ReviewResult.model_validate(VALID_RESULT)
+        verdicts = [HumanVerdict(finding_index=1, decision="accepted")]
+        with self.assertRaisesRegex(RuntimeError, "outcome recording failed"):
+            persist_feedback(FailedOutcomeMubit(), "run-1", "user-1", result, verdicts, [])
+        self.assertEqual(calls, ["remember", "record_outcome"])
 
     def test_feedback_summary_and_outcome_are_human_grounded(self):
         result = ReviewResult.model_validate(VALID_RESULT)
@@ -282,7 +319,11 @@ class ContractReviewTests(unittest.TestCase):
                 }
 
             def remember(self, **_kwargs):
-                return {"done": True, "status": "completed"}
+                return {
+                    "done": True,
+                    "status": "completed",
+                    "traces": [{"writes": [{"success": True, "record_id": "feedback-1"}]}],
+                }
 
             def record_outcome(self, **_kwargs):
                 return {"success": True}
